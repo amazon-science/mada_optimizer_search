@@ -8,15 +8,15 @@ This repository includes the code to simulate experiments for our paper [MADA: M
 
 `./results` includes some of the results that were mentioned in the quip document for the project.
 
-`./gdtuo.py` is the implementation of meta optimizer through hypergradient descent
+`./gdtuo.py` is the implementation of meta optimizer through hypergradient descent.
 
-`./model.py` includes a generic GPT-2 type implementation from nanoGPT
+`./model.py` includes a generic GPT-2 type implementation from nanoGPT.
 
-`./plot... .py` files are used to plot the results that are in ./results
+`./plot... .py` files are used to plot the results that are in ./results.
 
 `train.py`, `train_ddp.py`, `toy.py`, `toy2.py`,  includes the files to run experiments. 
 
-`train_ddp.py` is the latest run file and has from scratch supoorts for ddp, gradient_accumulation
+`train_ddp.py` is the latest run file and has from scratch supoorts for ddp, gradient_accumulation.
 
 Example run:
 
