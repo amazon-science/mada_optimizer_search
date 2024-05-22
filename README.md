@@ -1,11 +1,23 @@
-## My Project
+## MADA: Meta-Adaptive Optimizers through hyper-gradient Descent
 
-TODO: Fill this README out!
+**Authors: Kaan Ozkara, Can Karakus, Parameswaran Raman, Mingyi Hong, Shoham Sabach, Branislav Kveton, Volkan Cevher**
 
-Be sure to:
+This repository includes the code to simulate experiments for our paper [MADA: Meta Adaptive Momentum Estimates through Hypergradient Descent] (https://arxiv.org/abs/2401.08893). The GPT training code is based on nanoGPT by Andrej Karpathy (https://github.com/karpathy/nanoGPT). Meta optimizer implementation is inspired by (https://github.com/kach/gradient-descent-the-ultimate-optimizer/tree/main).
 
-* Change the title in this README
-* Edit your repository description on GitHub
+./config includes configuration files that controls the parameters in the code.
+./results includes some of the results that were mentioned in the quip document for the project.
+./gdtuo.py is the implementation of meta optimizer through hypergradient descent
+./model.py includes a generic GPT-2 type implementation from nanoGPT
+./plot... .py files are used to plot the results that are in ./results
+train.py, train_ddp.py, toy.py, toy2.py,  includes the files to run experiments. 
+
+train_ddp.py is the latest run file and has from scratch supoorts for ddp, gradient_accumulation
+
+Example run:
+
+`python train_ddp.py config/train_gpt2_small.py --dtype='float32' --beta1=0.9 --beta2=0.95 --beta3=0.0 --rho=0.6 --c=1.0 --gamma=1.0`
+
+The arguments here refer to the initial values of the optimizer parameters. You can add more variables regarding nanoGPT run, logging, grad accumulation and so on. Right now, to change the hypergradient hyperparameters (such as learning rate) and ddp size one needs update the code itself. The save folder for logging is fsx folder and needs to be changed inside the code. There are two types of logging, the first one is in every log_iter it logs the optimizer parameters, training loss and validation loss. The second one is the logging at the end of run.
 
 ## Citation
 
