@@ -17,7 +17,7 @@ Example run:
 
 `python train_ddp.py config/train_gpt2_small.py --dtype='float32' --beta1=0.9 --beta2=0.95 --beta3=0.0 --rho=0.6 --c=1.0 --gamma=1.0`
 
-The arguments here refer to the initial values of the optimizer parameters. You can add more variables regarding nanoGPT run, logging, grad accumulation and so on. Right now, to change the hypergradient hyperparameters (such as learning rate) and ddp size one needs update the code itself. The save folder for logging is fsx folder and needs to be changed inside the code. There are two types of logging, the first one is in every log_iter it logs the optimizer parameters, training loss and validation loss. The second one is the logging at the end of run.
+The arguments here refer to the initial values of the optimizer parameters. Additional variables about the nanoGPT run can also be included if needed for e.g. to determine  logging, grad accumulation and so on. At the moment, to change the hypergradient hyperparameters (such as learning rate) and ddp size one, please update the code. The output directory to save log files is set as a FSx directory and would need to be changed inside the code as well. There are two types of logging, the first one where for every `log_iter` the optimizer parameters, training loss and validation loss are logged. The second one is logging at the end of run.
 
 ## Citation
 
