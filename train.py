@@ -37,43 +37,12 @@ cwd = os.getcwd()
 import gdtuo
 from gdtuo import Meta
 
-def plot_grad_flow(named_parameters):
-    '''Plots the gradients flowing through different layers in the net during training.
-    Can be used for checking for possible gradient vanishing / exploding problems.
-    
-    Usage: Plug this function in Trainer class after loss.backwards() as 
-    "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow'''
-    ave_grads = []
-    max_grads= []
-    layers = []
-    for n, p in named_parameters:
-        if(p.requires_grad) and ("bias" not in n):
-            layers.append(n)
-            ave_grads.append(p.grad.abs().mean().cpu().detach())
-            max_grads.append(p.grad.abs().max().cpu().detach())
-    plt.figure()
-    plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="c")
-    plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")
-    plt.hlines(0, 0, len(ave_grads)+1, lw=2, color="k" )
-    plt.xticks(range(0,len(ave_grads), 1), layers, rotation="vertical")
-    plt.xlim(left=0, right=len(ave_grads))
-    plt.ylim(bottom = -0.001, top=0.02) # zoom in on the lower gradient regions
-    plt.xlabel("Layers")
-    plt.ylabel("average gradient")
-    plt.title("Gradient flow")
-    plt.grid(True)
-    plt.legend([Line2D([0], [0], color="c", lw=4),
-                Line2D([0], [0], color="b", lw=4),
-                Line2D([0], [0], color="k", lw=4)], ['max-gradient', 'mean-gradient', 'zero-gradient'])
-    plt.savefig("g_flow.png")
-
-
 from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
+out_dir = 'out-shakespeare'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -86,7 +55,7 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
+gradient_accumulation_steps = 1 # used to simulate larger batch sizes
 batch_size = 12 # if gradßient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -100,8 +69,8 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
 weight_decay = 1e-1
-beta1 = 0.6
-beta2 = 0.7
+beta1 = 0.9
+beta2 = 0.99
 beta3 = 0.0
 rho = 1.0
 gamma = 1.0
@@ -116,34 +85,24 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'float32' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
+adam = False
+hyperadam = False
+
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
-
+assert not (adam and hyperadam)
 # various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
-else:
+
+
     # if not ddp, we are running on a single gpu, and one process
-    master_process = True
-    seed_offset = 0
-    ddp_world_size = 1
+master_process = True
+seed_offset = 0
+ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
@@ -157,8 +116,8 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
-data_dir = os.path.join('/home/ubuntu/nanoGPT/data', dataset)
+# data loader
+data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split, ix =None ): 
@@ -248,15 +207,6 @@ if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
 
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
-
-# wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -297,15 +247,13 @@ if wandb_log and master_process:
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model # unwrap DDP container if needed
+raw_model = model
 running_mfu = -1.0
 
 #gdtuo wrapper
-optimizer_gdtuo = gdtuo.Meta(alpha=1e-3, beta1 = beta1, beta2 = beta2, beta3 = beta3, rho = rho, c = c, gamma = gamma,
-                              optimizer = gdtuo.Adam(alpha=5e-6))
-                              #) 
-                            #optimizer=gdtuo.SGDPerParam(params = [['beta1', 2e-3], ['beta2', 2e-3], ['beta3', 2e-3], ['rho',2e-3], ['c',7.5e-1]])) 
-                            #gdtuo.Adam(optimizer = gdtuo.SGD(alpha=1e-3))
+optimizer_gdtuo = gdtuo.Meta(alpha=1e-3, beta1 = beta1, beta2 = beta2, beta3 = beta3, rho = rho, c = c, gamma = gamma, eps =1e-8,
+                                optimizer=gdtuo.SGDPerParamMo(params = [['beta1', 2.5e-3, 0.5], ['beta2', 2.5e-3, 0.5], ['beta3', 2.5e-3, 0.5], ['rho', 2.5e-3, 0.5], ['c', 2.5e-3, 0.5], ['gamma', 2.5e-3, 0.0], ['alpha' ,0.0 , 0.0]  ]))
+                             
 mw = gdtuo.ModuleWrapper(model, optimizer=optimizer_gdtuo)
 mw.initialize()
 t = 0
@@ -319,14 +267,7 @@ gamma_init = mw.optimizer.parameters['gamma']
 
 while True:
     
-    # model_temp = GPT(gptconf)
-    # optimizer_gdtuo_temp = gdtuo.Adam(optimizer=gdtuo.SGD(1e-5))
-    # mw_temp = gdtuo.ModuleWrapper(model_temp, optimizer=optimizer_gdtuo_temp)
-    # mw_temp.initialize()
-    # model_temp.load_state_dict(model.state_dict())
     
-    # determine and set the learning rate for this iteration
-    #if iter_num < warmup_iters + 2:
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
@@ -365,69 +306,41 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    if hypergrad:
-        mw.begin()
-        mw.zero_grad()
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            if not hypergrad:
-                logits, loss = model(X, Y)
-                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-        if hypergrad:
-            logits, loss = mw.forward(X, Y)
-            loss = loss/gradient_accumulation_steps
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        
-        # backward pass, with gradient scaling if training in fp16
-        if not hypergrad:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward(create_graph = True)
-            mw.optimizer.parameters['alpha'].grad = torch.zeros_like(mw.optimizer.parameters['alpha'].grad)
-            # mw.optimizer.parameters['beta1'].grad = torch.zeros_like(mw.optimizer.parameters['beta1'].grad)
-            # mw.optimizer.parameters['beta2'].grad = torch.zeros_like(mw.optimizer.parameters['beta2'].grad)
-            # mw.optimizer.parameters['beta3'].grad = torch.zeros_like(mw.optimizer.parameters['beta3'].grad)
-            # mw.optimizer.parameters['rho'].grad = torch.zeros_like(mw.optimizer.parameters['rho'].grad)
-            # mw.optimizer.parameters['c'].grad = torch.zeros_like(mw.optimizer.parameters['c'].grad)
-            # mw.optimizer.parameters['gamma'].grad = torch.zeros_like(mw.optimizer.parameters['gamma'].grad)
-            
-            
-            #plot_grad_flow(mw.module.named_parameters())
-        X, Y = get_batch('train')
+
+    mw.begin()
+    mw.zero_grad()
+    
+
+    logits, loss = mw.forward(X, Y)
+    loss = loss/gradient_accumulation_steps
+    
+    # backward pass, with gradient scaling if training in fp16
+
+    loss.backward(create_graph = True)
+    mw.optimizer.parameters['alpha'].grad = torch.zeros_like(mw.optimizer.parameters['alpha'].grad)
+    if adam:
+        for n, p in mw.optimizer.parameters.items():
+            p.grad = torch.zeros_like(p)
+    elif hyperadam:
+        for n, p in mw.optimizer.parameters.items():
+            if n != 'beta1' and n != 'beta2':
+                p.grad = torch.zeros_like(p)
+    X, Y = get_batch('train')
     # clip the gradient
-    if not hypergrad:
-        if grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    else:
-        if grad_clip != 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            for n,v in mw.optimizer.parameters.items():
-                torch.nn.utils.clip_grad_norm_(v,10.0)
+    
+    if grad_clip != 0.0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        for n,v in mw.optimizer.parameters.items():
+            torch.nn.utils.clip_grad_norm_(v,10.0)
     # step the optimizer and scaler if training in fp16
-    if not hypergrad:
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-    else:
-        #with torch.no_grad():
-        #manual weight decay:
-        for p in model.parameters():
-            if p.data.dim() >= 2 and p.requires_grad:
-                p.data.copy_(p.data - mw.optimizer.parameters['alpha']*weight_decay*p.data)
-        mw.step()
-        mw.zero_grad()
-        #mw.optimizer.parameters['alpha'][mw.optimizer.parameters['alpha']<0] = 1e-5
-    # flush the gradients as soon as we can, no need for this memory anymore
-    #optimizer.zero_grad(set_to_none=True)
+    
+    #manual weight decay:
+    for p in model.parameters():
+        if p.data.dim() >= 2 and p.requires_grad:
+            p.data.copy_(p.data - mw.optimizer.parameters['alpha']*weight_decay*p.data)
+    mw.step()
+    mw.zero_grad()
+   
     
     device_id =  device[-1]
     # timing and logging
@@ -445,9 +358,7 @@ while True:
         print(f"beta1 {Meta.clamp(mw.optimizer.parameters['beta1']):.4f}, beta2 {Meta.clamp(mw.optimizer.parameters['beta2'], 0.51,0.99):.4f}, beta3 {Meta.clamp(mw.optimizer.parameters['beta3'],0.0,1.0):.4f}, rho {Meta.clamp(mw.optimizer.parameters['rho'],0.0,1.0):.4f}, c {Meta.clamp(mw.optimizer.parameters['c'],0.0,1.0):.4f}, gamma {Meta.clamp(mw.optimizer.parameters['gamma'],0.0,1.0):.4f}")#, hyper alpha {mw.optimizer.optimizer.parameters['alpha']}")
         res = np.array([mw.optimizer.parameters['beta1'].detach().cpu(), mw.optimizer.parameters['beta2'].detach().cpu(), mw.optimizer.parameters['beta3'].detach().cpu(), mw.optimizer.parameters['rho'].detach().cpu(), mw.optimizer.parameters['c'].detach().cpu(), mw.optimizer.parameters['gamma'].detach().cpu(), losses['train'], losses['val']])
         res = np.reshape(res,(1,8))
-        if hypergrad:
-            with open('/fsx/results/beta_traj_owt' + str(device_id) + '.txt', 'a+') as f:
-                np.savetxt(f, res ,delimiter =', ', fmt='%f')
+        
     iter_num += 1
     local_iter_num += 1
 
@@ -461,17 +372,19 @@ while True:
         print(device_id)
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%") 
         print(f"beta1 {mw.optimizer.parameters['beta1']:.4f}, beta2 {mw.optimizer.parameters['beta2']:.4f}, beta3 {mw.optimizer.parameters['beta3']:.4f}, alpha {mw.optimizer.parameters['alpha']}")
-        # res = np.array([Meta.clamp(mw.optimizer.parameters['beta1']).detach().cpu(), Meta.clamp(mw.optimizer.parameters['beta2']).detach().cpu(), losses['train'], losses['val']])
-        # res = np.reshape(res,(1,4))
+        
         res = np.array([beta1_init.detach().cpu(), beta2_init.detach().cpu(), beta3_init.detach().cpu(), rho_init.detach().cpu(), c_init.detach().cpu(), gamma_init.detach().cpu(), losses['train'], losses['val']])
         res = np.reshape(res,(1,8))
-        # with open('/fsx/results/beta_log6.txt', 'a+') as f:
-        #     np.savetxt(f, res ,delimiter =', ', fmt='%f')
+        
         if hypergrad:
-            with open('/fsx/results/hyper_train_log_owt' + str(device_id) + '.txt', 'a+') as f:
-                np.savetxt(f, res ,delimiter =', ', fmt='%f')
+            if adam:
+                with open(out_dir + '/results/train_log_adam' + str(device_id) + '.txt', 'a+') as f:
+                    np.savetxt(f, res ,delimiter =', ', fmt='%f')
+            elif hyperadam:
+                with open(out_dir + '/results/train_log_hyperadam' + str(device_id) + '.txt', 'a+') as f:
+                    np.savetxt(f, res ,delimiter =', ', fmt='%f')
+            else:
+                with open(out_dir + '/results/train_log_mada_3_b3r' + str(device_id) + '.txt', 'a+') as f:
+                    np.savetxt(f, res ,delimiter =', ', fmt='%f')
         break
 
-
-if ddp:
-    destroy_process_group()

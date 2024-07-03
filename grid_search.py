@@ -61,7 +61,7 @@ print(beta2_list)
 for i in beta1_list:
     for j in beta2_list:
 
-        command = "python train.py config/train_shakespeare_char.py "  + "--beta1=" + str(i) + " --beta2=" + str(j) + " --device=cuda:" + str(device) + " --dtype='float32'"
+        command = "python train.py config/train_shakespeare_char.py "  + "--beta1=" + str(i) + " --beta2=" + str(j) + " --device=cuda:" + str(device) + " --dtype='float32'" + " --hyperadam=False" + " --adam=False"
         print(command)
         os.system(command)
 

@@ -3,23 +3,27 @@ from matplotlib import pyplot as plt
 
 
 betas = []
-with open('/fsx/results/parameters'+str(0) + '.txt', 'r') as f:
+# with open('out_mada/20230916-233953/traj_owt_gpt2_124_mada.txt', 'r') as f:
+with open('out_mada/20230910-003939/traj_owt_gpt2_124_mada.txt', 'r') as f:
+# with open('out_mada/20230913-193726/traj_owt_gpt2_124_mada.txt', 'r') as f:
     res = np.genfromtxt(f ,delimiter =', ')
 
+    
+
 plt.figure()
-#plt.tricontourf(res_np[:,0][np.logical_and(res_np[:,1]>= 0.75,res_np[:,0]>= 0.75)], res_np[:,1][np.logical_and(res_np[:,1]>= 0.75,res_np[:,0]>= 0.75)], res_np[:,2][np.logical_and(res_np[:,1]>= 0.75,res_np[:,0]>= 0.75)], levels = 30, vmin = 0.6, vmax = 0.8)
-#plt.tricontourf(res[:,0][np.logical_and(res[:,1]>= 0.5,True)], res_np[:,1][np.logical_and(res_np[:,1]>= 0.5,True)], res_np[:,2][np.logical_and(res_np[:,1]>= 0.5,True)], levels = 30, vmin = 0.6, vmax = 0.8)
-plt.plot(res[:,0])
-plt.plot(res[:,1])
-plt.plot(res[:,2])
-plt.plot(res[:,3])
-plt.plot(res[:,4])
-plt.plot(res[:,5])
-plt.legend(['Beta1','Beta2', 'Beta3', 'rho', 'c', 'gamma'])
-plt.xlabel("Iterations")
-plt.ylabel("Parameter value")
-plt.yticks(list(np.arange(0,1.1,0.1)))
-plt.title("h_lr=1e-3 h_mu = 0; h_lr= 1e-2, mu =0.9 for rho,c,gamma, val_loss = 3.7861",fontsize = 8 )
+x_labels = ['0', '20K', '40K', '60K', '80K', '100K']
+ticks = [0, 20, 40, 60, 80, 100]
+plt.plot(res[:,0][::100])
+plt.plot(res[:,1][::100])
+plt.plot(res[:,2][::100])
+plt.plot(res[:,3][::100])
+plt.plot(res[:,4][::100])
+plt.plot(res[:,5][::100])
+plt.legend([r'$\beta_1$',r'$\beta_2$', r'$\beta_3$', r'$\rho$', r'c', r'$\gamma$'])
+plt.xlabel("Iterations", fontsize = 14)
+plt.ylabel("Parameter value", fontsize = 14)
+plt.yticks(list(np.arange(0,1.1,0.2)), fontsize = 14)
+plt.xticks(ticks,labels=x_labels, fontsize = 14)
 plt.grid()
 plt.show()
-plt.savefig("parameters0.png", dpi=300)
+plt.savefig("results/parameters_gpt2_3.png", dpi=900)

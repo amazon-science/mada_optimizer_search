@@ -1,20 +1,3 @@
-"""
-This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
-
-To run on a single GPU, example:
-$ python train.py --batch_size=32 --compile=False
-
-To run with DDP on 4 gpus on 1 node, example:
-$ torchrun --standalone --nproc_per_node=4 train.py
-
-To run with DDP on 4 gpus across 2 nodes, example:
-- Run on the first (master) node with example IP 123.456.123.456:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
-- Run on the worker node:
-$ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123.456 --master_port=1234 train.py
-(If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
-"""
 
 import sys
 import os
@@ -38,23 +21,24 @@ cwd = os.getcwd()
 import gdtuo
 from gdtuo import Meta
 
+
+
 from model import GPTConfig, GPT
 
-# -----------------------------------------------------------------------------
-# default config values designed to train a gpt2 (124M) on OpenWebText
-# I/O
-out_dir = 'out'
+
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
-hypergrad_init_iter = 200
+hypergrad_init_iter = 0
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+out_dir = 'out_adam/'
+ckpt_path = os.path.join(out_dir, 'ckpt.pt')
 # wandb logging
 wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_project = 'mada'
+wandb_run_name='gpt2-124M'
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 # used to simulate larger batch sizes
@@ -72,13 +56,14 @@ bias = False # do we use bias inside LayerNorm and Linear layers?
 learning_rate = 1e-3 # max learning rate
 max_iters = 10000 # total number of training iterations
 weight_decay = 1e-1
-beta1 = 0.6
-beta2 = 0.7
+beta1 = 0.9
+beta2 = 0.95
 beta3 = 0.0
 rho = 1.0
 gamma = 1.0
 c = 1.0
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+eps = 1e-6
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 0 # how many steps to warm up for
@@ -88,57 +73,39 @@ min_lr = 1e-4 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = False # use PyTorch 2.0 to compile the model to be faster
+dtype =  'float32' 
 adam = False
 hyperadam = False
+timestr = time.strftime("%Y%m%d-%H%M%S")
+deterministic_validation = True #fixes the validation set batches
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
-print(n_layer,n_head, n_embd, batch_size)
-# various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
+#directory name depends on the start time
+if adam:
+    out_dir = 'out_adam/' + timestr 
 else:
-    # if not ddp, we are running on a single gpu, and one process
-    master_process = True
-    seed_offset = 0
-    ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+    out_dir = 'out_mada/' + timestr
+    
+torch.backends.cudnn.enabled=True
 
-if master_process:
-    os.makedirs(out_dir, exist_ok=True)
-seed = 1
+seed = 5000
 torch.manual_seed(seed) #originally 1337
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
-# note: float16 data type will automatically use a GradScaler
+# note: float16 data type will automatically use a GradScalerc
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
-# poor man's data loader
-data_dir = os.path.join('/home/ubuntu/nanoGPT/data', dataset)
+# data loader
+data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-def get_batch(split, device, rank, ix =None): 
-    data_dir = os.path.join('/home/ubuntu/nanoGPT/data', dataset)
+def get_batch(split, device, rank, cur_iter = 0, ix =None): 
     train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
     val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     data = train_data if split == 'train' else val_data
@@ -147,7 +114,11 @@ def get_batch(split, device, rank, ix =None):
     if split == 'train':
         ix = torch.randint(int(leng*(rank)), int(leng*(rank+1)) - block_size, (batch_size,))
     else:
-        ix = torch.randint(len(data) - block_size, (batch_size,))
+        if deterministic_validation:
+            chunk = int((len(data)-block_size)/eval_iters)
+            ix = torch.arange(chunk*cur_iter, chunk*(cur_iter+1), block_size)
+        else:
+            ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     if device_type == 'cuda':
@@ -164,7 +135,6 @@ def average_gradients(model):
         dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
         param.grad.data /= size
 
-""" Gradient averaging for optimizer parameters. """
 def average_gradients_opt(mw):
     size = float(dist.get_world_size())
     for name, param in mw.optimizer.parameters.items():
@@ -178,10 +148,20 @@ def average_params_opt(mw):
         param.data /= size
 
 def train(rank, size):
-    # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
+
+    tokens_per_iter = gradient_accumulation_steps * size * batch_size * block_size
+    print(f"tokens per iteration will be: {tokens_per_iter:,}")
+
+    #for some reason if I don't define it here it throws an error
+    wandb_run_name='gpt2-124M'
+
+    master_process = rank == 0
+    if master_process:
+        os.makedirs(out_dir, exist_ok=True)
     iter_num = 0
     best_val_loss = 1e9
     device = 'cuda:' + str(rank)
+    torch.set_default_device(device)
     # attempt to derive vocab_size from the dataset
     meta_path = os.path.join(data_dir, 'meta.pkl')
     meta_vocab_size = None
@@ -206,7 +186,7 @@ def train(rank, size):
     elif init_from == 'resume':
         print(f"Resuming training from {out_dir}")
         # resume training from a checkpoint.
-        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+        
         checkpoint = torch.load(ckpt_path, map_location=device)
         checkpoint_model_args = checkpoint['model_args']
         # force these config attributes to be equal otherwise we can't even resume training
@@ -240,27 +220,7 @@ def train(rank, size):
         model_args['block_size'] = block_size # so that the checkpoint will have the right value
 
     model.to(device)
-    if dist.get_rank() == 0:
-        for n, p in model.named_parameters():
-            print(n, p.shape)
-    #torch.manual_seed(seed)
-    # initialize a GradScaler. If enabled=False scaler is a no-op
-    scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
-
-    # optimizer
-    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-
-
-    if init_from == 'resume':
-        optimizer.load_state_dict(checkpoint['optimizer'])
-    checkpoint = None # free up memory
-
-    # compile the model
-    if compile:
-        print("compiling the model... (takes a ~minute)")
-        unoptimized_model = model
-        model = torch.compile(model) # requires PyTorch 2.0
 
 
     # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -271,7 +231,7 @@ def train(rank, size):
         for split in ['train', 'val']:
             losses = torch.zeros(eval_iters)
             for k in range(eval_iters):
-                X, Y = get_batch(split, device, rank)
+                X, Y = get_batch(split, device, rank, k)
                 with ctx:
                     logits, loss = model(X, Y)
                 losses[k] = loss.item()
@@ -297,6 +257,12 @@ def train(rank, size):
 
     # logging
     if wandb_log and master_process:
+        if adam:
+            wandb_run_name = wandb_run_name + '-adam'
+        elif hyperadam:
+            wandb_run_name = wandb_run_name + '-hyperadam'
+        else:
+            wandb_run_name = wandb_run_name + '-mada'
         import wandb
         wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
@@ -305,97 +271,121 @@ def train(rank, size):
     X, Y = get_batch('train', device, rank) # fetch the very first batch
     t0 = time.time()
     local_iter_num = 0 # number of iterations in the lifetime of this process
-    raw_model = model.module if ddp else model # unwrap DDP container if needed
+    raw_model = model 
     running_mfu = -1.0
 
-    #gdtuo wrapper
-    optimizer_gdtuo = gdtuo.Meta(alpha=1e-3, beta1 = beta1, beta2 = beta2, beta3 = beta3, rho = rho, c = c, gamma = gamma,
-                                optimizer=gdtuo.SGDPerParamMo(params = [['beta1', 1e-3, 0.0], ['beta2', 1e-3, 0.0], ['beta3', 1e-2, 0.0], ['rho', 1e-2, 0.0], ['c', 1e-2, 0.5], ['gamma',0.0, 0.9], ['eps' , 0.0 , 0.0], ['alpha' ,0.0 , 0.0]  ]))
-    mw = gdtuo.ModuleWrapper(model, optimizer=optimizer_gdtuo)
+    #construct gdtuo wrapper
+    optimizer_gdtuo = gdtuo.Meta(alpha=1e-3, beta1 = beta1, beta2 = beta2, beta3 = beta3, rho = rho, c = c, gamma = gamma, eps=1e-6,
+                                optimizer=gdtuo.SGDPerParamMo(params = [['beta1', 5e-4, 0.0], ['beta2', 5e-4, 0.0], ['beta3', 1e-1, 0.0], ['rho', 1e-1, 0.0], ['c', 1e-1, 0.0], ['gamma',1e-1, 0.0], ['alpha' ,0.0 , 0.0]  ]))
+ 
+
+    if init_from=='scratch':
+        mw = gdtuo.ModuleWrapper(model, optimizer=optimizer_gdtuo)
+    elif init_from=='resume':
+        mw = checkpoint['mw']
     mw.initialize()
+    #set parameters
+    mw.optimizer.parameters['beta3'] = torch.tensor(beta3, device = device)
+    mw.optimizer.parameters['rho'] = torch.tensor(rho, device = device)
+    mw.optimizer.parameters['c'] = torch.tensor(c, device = device)
+    mw.optimizer.parameters['gamma'] = torch.tensor(gamma, device = device)
 
     t = 0
-    print(f"beta1 {Meta.clamp(mw.optimizer.parameters['beta1']):.4f}, beta2 {Meta.clamp(mw.optimizer.parameters['beta2'], 0.501,0.99):.4f}, beta3 {Meta.clamp(mw.optimizer.parameters['beta3'], 0.0, 1.0):.4f}, alpha {mw.optimizer.parameters['alpha']}")
+    print(f"beta1 {Meta.clamp(mw.optimizer.parameters['beta1']).data:.4f}, beta2 {Meta.clamp(mw.optimizer.parameters['beta2'], 0.501,0.99).data:.4f}, beta3 {Meta.clamp(mw.optimizer.parameters['beta3'], 0.0, 1.0).data:.4f}, alpha {mw.optimizer.parameters['alpha'].data}")
     beta1_init = mw.optimizer.parameters['beta1']
     beta2_init = mw.optimizer.parameters['beta2']
     beta3_init = mw.optimizer.parameters['beta3']
     rho_init = mw.optimizer.parameters['rho']
     c_init = mw.optimizer.parameters['c']
     gamma_init = mw.optimizer.parameters['gamma']
+    lr = get_lr(iter_num)
     while True:
-        
-        
+
         # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % eval_interval == 0 and master_process:
+        if iter_num % eval_interval == 0:
             losses = estimate_loss()
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
+            
+            if wandb_log and rank == 0:
+                wandb.log({
+                    "iter": iter_num,
+                    "train/loss": losses['train'],
+                    "val/loss": losses['val'],
+                    "lr": lr,
+                    "mfu": running_mfu*100, # convert to percentage
+                    "beta1": mw.optimizer.parameters['beta1'],
+                    "beta2": mw.optimizer.parameters['beta2'],
+                    "beta3": mw.optimizer.parameters['beta3'],
+                    "rho": mw.optimizer.parameters['rho'],
+                    "c": mw.optimizer.parameters['c'],
+                    "gamma": mw.optimizer.parameters['gamma']
+                })
+            if (losses['val'] < best_val_loss or always_save_checkpoint) and rank == 0:
+                print(mw.module.get_num_params())
+                print(model.get_num_params())
+                best_val_loss = losses['val']
+                if iter_num > 0:
+                    checkpoint = {
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_mw': mw.optimizer,
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'training_loss': losses['train'],
+                        'config': config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt' + str(iter_num) + '.pt'))
+                    
 
         if iter_num == 0 and eval_only:
             break
 
-        # forward backward update, with optional gradient accumulation to simulate larger batch size
-        # and using the GradScaler if data type is float16
-        if hypergrad:
-            mw.begin()
+        mw.begin()
+        if iter_num == 0: #initialize the grads in the first iteration
             mw.zero_grad()
-
 
         logits, loss = mw.forward(X, Y)
         loss = loss/gradient_accumulation_steps
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train', device, rank)
-        # backward pass, with gradient scaling if training in fp16
-
         loss.backward()
-            
                     
-                
+        # we are not updating the lr
         mw.optimizer.parameters['alpha'].grad = torch.zeros_like(mw.optimizer.parameters['alpha'])
-        # mw.optimizer.parameters['beta1'].grad = torch.zeros_like(mw.optimizer.parameters['beta1'].grad)
-        if iter_num < hypergrad_init_iter:
-            mw.optimizer.parameters['beta1'].grad = torch.zeros_like(mw.optimizer.parameters['beta1'].grad)
-            mw.optimizer.parameters['beta2'].grad = torch.zeros_like(mw.optimizer.parameters['beta2'].grad)
-            mw.optimizer.parameters['beta3'].grad = torch.zeros_like(mw.optimizer.parameters['beta3'].grad)
-            mw.optimizer.parameters['rho'].grad = torch.zeros_like(mw.optimizer.parameters['rho'].grad)
-            mw.optimizer.parameters['c'].grad = torch.zeros_like(mw.optimizer.parameters['c'].grad)
-            mw.optimizer.parameters['gamma'].grad = torch.zeros_like(mw.optimizer.parameters['gamma'].grad)
-            mw.optimizer.parameters['eps'].grad = torch.zeros_like(mw.optimizer.parameters['eps'].grad)
-        if adam:
-            mw.optimizer.parameters['alpha'].grad = torch.zeros_like(mw.optimizer.parameters['alpha'].grad)
-            mw.optimizer.parameters['beta1'].grad = torch.zeros_like(mw.optimizer.parameters['beta1'].grad)
-            mw.optimizer.parameters['beta2'].grad = torch.zeros_like(mw.optimizer.parameters['beta2'].grad)
-            mw.optimizer.parameters['beta3'].grad = torch.zeros_like(mw.optimizer.parameters['beta3'].grad)
-            mw.optimizer.parameters['rho'].grad = torch.zeros_like(mw.optimizer.parameters['rho'].grad)
-            mw.optimizer.parameters['c'].grad = torch.zeros_like(mw.optimizer.parameters['c'].grad)
-            mw.optimizer.parameters['gamma'].grad = torch.zeros_like(mw.optimizer.parameters['gamma'].grad)
-        if hyperadam:
-            mw.optimizer.parameters['alpha'].grad = torch.zeros_like(mw.optimizer.parameters['alpha'].grad)
-            mw.optimizer.parameters['beta3'].grad = torch.zeros_like(mw.optimizer.parameters['beta3'].grad)
-            mw.optimizer.parameters['rho'].grad = torch.zeros_like(mw.optimizer.parameters['rho'].grad)
-            mw.optimizer.parameters['c'].grad = torch.zeros_like(mw.optimizer.parameters['c'].grad)
-            mw.optimizer.parameters['gamma'].grad = torch.zeros_like(mw.optimizer.parameters['gamma'].grad)
+        if iter_num < hypergrad_init_iter or adam:
+            for n, p in mw.optimizer.parameters.items():
+                p.grad = torch.zeros_like(p)
+
+        elif hyperadam:
+            
+            for n, p in mw.optimizer.parameters.items():
+                if n != 'beta1' and n != 'beta2':
+                    p.grad = torch.zeros_like(p)
         
+        alpha_temp = mw.optimizer.parameters['alpha'].data
         
-        #update the optimizer parameters through hypergradient descent
-        if mw.optimizer.parameters['beta1'].grad.data != torch.tensor(0.0) and not adam:
+        #if previous iteration was a model update iteration, update optimizer state
+        if not adam and (((iter_num-1) % gradient_accumulation_steps == 1) or gradient_accumulation_steps == 1): #mw.optimizer.parameters['beta1'].grad is not None and mw.optimizer.parameters['beta1'].grad.data != torch.tensor(0.0) and not adam:
 
             average_gradients_opt(mw)
             for n,v in mw.optimizer.parameters.items():
                 torch.nn.utils.clip_grad_norm_(v,10.0)
             alpha_temp = mw.optimizer.parameters['alpha'].data
-            mw.optimizer.parameters['alpha'].data = torch.tensor(0.0)
+            mw.optimizer.parameters['alpha'].data = torch.tensor(0.0) #to make sure model is not updated
             mw.optimizer.optimizer.step(mw.optimizer.parameters)
+
             mw.optimizer.parameters['alpha'].data = alpha_temp
+            mw.optimizer.zero_grad()
+
         
-        # update the model parameters
-        if iter_num % gradient_accumulation_steps != 1:
+        if iter_num % gradient_accumulation_steps != 1 and gradient_accumulation_steps != 1:
             mw.optimizer.parameters['alpha'].data = alpha_temp
             mw.detach()
-        if iter_num % gradient_accumulation_steps == 1:
+        #if current iteration is an update iteration
+        if iter_num % gradient_accumulation_steps == 1 or gradient_accumulation_steps == 1:
+            #get the correct learning rate
             lr = get_lr(iter_num) if decay_lr else learning_rate
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
             mw.optimizer.parameters['alpha'].data = torch.tensor(lr)
 
             if grad_clip != 0.0:
@@ -406,12 +396,11 @@ def train(rank, size):
             for p in model.parameters():
                 if p.data.dim() >= 2 and p.requires_grad:
                     p.data.copy_(p.data - mw.optimizer.parameters['alpha']*weight_decay*p.data)
+            
+            #gradient averaging
             average_gradients(model)
             mw.step()
-            #losses = estimate_loss()
-            #print(device_id, iter_num, losses['val'])
-            mw.zero_grad()
-        
+            mw.zero_grad()                
         
         device_id =  device[-1]
         # timing and logging
@@ -427,13 +416,16 @@ def train(rank, size):
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             if rank == 0:
                 print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%") 
-                print(f"beta1 {Meta.clamp(mw.optimizer.parameters['beta1']):.4f}, beta2 {Meta.clamp(mw.optimizer.parameters['beta2'], 0.51,0.99):.4f}, beta3 {Meta.clamp(mw.optimizer.parameters['beta3'],0.0,1.0):.4f}, rho {Meta.clamp(mw.optimizer.parameters['rho'],0.0,1.0):.4f}, c {Meta.clamp(mw.optimizer.parameters['c'],0.0,1.0):.4f}, gamma {Meta.clamp(mw.optimizer.parameters['gamma'],0.0,1.0):.4f}, eps {mw.optimizer.parameters['eps']}, alpha {mw.optimizer.parameters['alpha']}")#, hyper alpha {mw.optimizer.optimizer.parameters['alpha']}")
-                res = np.array([mw.optimizer.parameters['beta1'].detach().cpu(), mw.optimizer.parameters['beta2'].detach().cpu(), mw.optimizer.parameters['beta3'].detach().cpu(), mw.optimizer.parameters['rho'].detach().cpu(), mw.optimizer.parameters['c'].detach().cpu(), mw.optimizer.parameters['gamma'].detach().cpu(), losses['train'], losses['val']])
+                print(f"beta1 {Meta.clamp(mw.optimizer.parameters['beta1']).data:.4f}, beta2 {Meta.clamp(mw.optimizer.parameters['beta2'], 0.51,0.99).data:.4f}, beta3 {Meta.clamp(mw.optimizer.parameters['beta3'],0.0,1.0).data:.4f}, rho {Meta.clamp(mw.optimizer.parameters['rho'],0.0,1.0).data:.4f}, c {Meta.clamp(mw.optimizer.parameters['c'],0.0,1.0).data:.4f}, gamma {Meta.clamp(mw.optimizer.parameters['gamma'],0.0,1.0).data:.4f}, alpha {mw.optimizer.parameters['alpha'].data}")#, hyper alpha {mw.optimizer.optimizer.parameters['alpha']}")
+                res = np.array([mw.optimizer.parameters['beta1'].cpu().detach(), mw.optimizer.parameters['beta2'].cpu().detach(), mw.optimizer.parameters['beta3'].cpu().detach(), mw.optimizer.parameters['rho'].cpu().detach(), mw.optimizer.parameters['c'].cpu().detach(), mw.optimizer.parameters['gamma'].cpu().detach(), losses['train'].cpu(), losses['val'].cpu()])
                 res = np.reshape(res,(1,8))
-                #save folder for logging
                 if hypergrad and rank == 0:
-                    with open('/fsx/results/beta_traj_owt_gpt2_124' + str(device_id) + '.txt', 'a+') as f:
-                        np.savetxt(f, res ,delimiter =', ', fmt='%f')
+                    if adam:
+                        with open( out_dir + '/traj_owt_gpt2_adam' + '.txt', 'a+') as f:
+                            np.savetxt(f, res ,delimiter =', ', fmt='%f')
+                    else:
+                        with open( out_dir + '/traj_owt_gpt2_mada' + '.txt', 'a+') as f:
+                            np.savetxt(f, res ,delimiter =', ', fmt='%f')
         iter_num += 1
         local_iter_num += 1
 
@@ -441,24 +433,43 @@ def train(rank, size):
         # termination conditions
         if iter_num > max_iters or math.isnan(losses['train']):
             losses = estimate_loss()
-            res = np.array([beta1, beta2, losses['train']])
-            res = np.reshape(res,(1,3))
             
             print(device_id)
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%") 
+            print(f"iter {iter_num}: loss {losses['val'].item():.4f}") 
             print(f"beta1 {mw.optimizer.parameters['beta1']:.4f}, beta2 {mw.optimizer.parameters['beta2']:.4f}, beta3 {mw.optimizer.parameters['beta3']:.4f}, alpha {mw.optimizer.parameters['alpha']}")
-
-            res = np.array([beta1_init.detach().cpu(), beta2_init.detach().cpu(), beta3_init.detach().cpu(), rho_init.detach().cpu(), c_init.detach().cpu(), gamma_init.detach().cpu(), losses['train'], losses['val']])
+            res = np.array([beta1_init.detach().cpu(), beta2_init.detach().cpu(), beta3_init.detach().cpu(), rho_init.detach().cpu(), c_init.detach().cpu(), gamma_init.detach().cpu(), losses['train'].cpu(), losses['val'].cpu()])
             res = np.reshape(res,(1,8))
             if hypergrad and rank == 0:
-                with open('/fsx/results/hyper_train_log_owt_gpt2_124.txt', 'a+') as f:
-                    np.savetxt(f, res ,delimiter =', ', fmt='%f')
+                if adam:
+                    with open(out_dir + '/hyper_train_log_owt_gpt2_adam.txt', 'a+') as f:
+                        np.savetxt(f, res ,delimiter =', ', fmt='%f')
+                else:
+                    with open(out_dir + '/hyper_train_log_owt_gpt2_mada.txt', 'a+') as f:
+                        np.savetxt(f, res ,delimiter =', ', fmt='%f')
+
+            if losses['val'] < best_val_loss and rank == 0:
+                best_val_loss = losses['val']
+                if iter_num > 0:
+                    checkpoint = {
+                        'model_state_dict': model.state_dict(),
+                        'mw': mw,
+                        'optimizer': mw.optimizer,
+                        'model_args': model_args,
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'training_loss': losses['train'],
+                        'config': config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt')) #('ckpt_{}.pt'.format(int(time.time())))
+
+
             break
 
 
-def init_process(rank, size, fn, backend='gloo'):
+def init_process(rank, size, fn, backend='nccl'):
     """ Initialize the distributed environment. """
-    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_ADDR'] = '127.0.0.0'
     os.environ['MASTER_PORT'] = '29500'
     dist.init_process_group(backend, rank=rank, world_size=size)
     fn(rank, size)
@@ -476,5 +487,3 @@ if __name__ == "__main__":
     for p in processes:
         p.join()
 
-if ddp:
-    destroy_process_group()

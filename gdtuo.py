@@ -20,6 +20,8 @@ class Optimizable:
     '''
     def __init__(self, parameters, optimizer):
         self.parameters = parameters # a dict mapping names to tensors
+        # if 'transformer.wte.weight' in self.parameters:
+        #     self.parameters['transformer.wte.weight'] = self.parameters['lm_head.weight']
         self.optimizer = optimizer   # which must itself be Optimizable!
         self.all_params_with_gradients = []
 
@@ -29,8 +31,8 @@ class Optimizable:
     
     def begin(self):
         ''' Enable gradient tracking on current parameters. '''
-        for param in self.all_params_with_gradients:
-             param.grad = None
+        # for param in self.all_params_with_gradients:
+        #      param.grad = None
         self.all_params_with_gradients.clear()
         for name, param in self.parameters.items():
             param.requires_grad_() # keep gradient information...
@@ -258,29 +260,15 @@ class Meta(Optimizable):
     '''
     A hyperoptimizable Meta optimizer.
     '''
-    # def clamp_orig(x):
-    #     return (x.tanh() + 1.) / 2.
-
-    # def unclamp_orig(y):
-    #     z = y * 2. - 1.
-    #     return ((1. + z) / (1. - z)).log() / 2.
-
-    def clamp_new(x, min_=0.01, max_=0.99):
-        return Meta.clamp((x.tanh() + 0.9) / 1.8, min_, max_)
-
-    def unclamp_new(y):
-        z = y * 1.8 - 0.9
-        return ((1. + z) / (1. - z)).log() / 2.
     
     def clamp(x, min_ = 0.01, max_ = 0.99 ):
-        # if x.grad:
-        #     x.grad = torch.zeros_like(x.grad)
+
         if x>=max_:
             x.data = max_*torch.ones_like(x)
         elif x<=min_:
             x.data = min_*torch.ones_like(x)
         return x
-        #return (x.tanh() + 3.) / 4.
+
 
     def unclamp(y):
         return y
@@ -295,8 +283,7 @@ class Meta(Optimizable):
             'beta3': Meta.unclamp(torch.tensor(beta3)),
             'rho': Meta.unclamp(torch.tensor(rho)),
             'c': Meta.unclamp(torch.tensor(c)),
-            'gamma': Meta.unclamp(torch.tensor(gamma)),
-            'eps': Meta.unclamp(torch.tensor(eps)),
+            'gamma': Meta.unclamp(torch.tensor(gamma))
         }
         super().__init__(parameters, optimizer)
         self.num_stepments = 0
@@ -307,36 +294,43 @@ class Meta(Optimizable):
         self.optimizer.step(self.parameters)
         t = self.num_stepments
         
+        #clamp variables
         beta1 = Meta.clamp(self.parameters['beta1'], min_ = 0.01, max_ = 0.99)
-        beta2 = Meta.clamp(self.parameters['beta2'], min_ = 0.501, max_ = 0.99) # min 0.01 for amsgrad toy example, 0.501 for GPT
+        beta2 = Meta.clamp(self.parameters['beta2'], min_ = 0.501, max_ = 0.99) # min 0.501 for GPT
         beta3 = Meta.clamp(self.parameters['beta3'], min_ = 0.00, max_ = 0.99)
-        eps = Meta.clamp(self.parameters['eps'], min_ = 1e-10, max_ = 1e-4)
         rho = Meta.clamp(self.parameters['rho'], min_ = 0.0, max_ = 1.0)
         c = Meta.clamp(self.parameters['c'], min_ = 0.0, max_ = 1.0)
         gamma = Meta.clamp(self.parameters['gamma'], min_ = 0.0, max_ = 1.0)
-        beta1_lion = 0.9
-        beta2_lion = 0.99
+        beta1_lion = 0.95 #parameters suggested for lion for GPT-2
+        beta2_lion = 0.98
+
+        param_cache = {}
 
         for name, param in params.items():
+            if id(param) in param_cache:
+                params[name] = param_cache[id(param)]
+                continue
 
+            if param.grad is None:
+                print("none", name)
+                continue
+                
             g = param.grad.detach()
             if name not in self.cache:
                 self.cache[name] = {
                     'm': torch.zeros_like(param),
                     'v': torch.zeros_like(param) + 1e-15,
                     'v_mean': torch.zeros_like(param)+ 1e-15, #+\
-                            #self.eps,d
                     'n': g * g,
-                    'g': torch.zeros_like(param)
-                    # 'm_lion': torch.zeros_like(param),
-                    # 'u_lion': torch.zeros_like(param)
+                    'g': torch.zeros_like(param),
+                    'm_lion': torch.zeros_like(param),
+                    'u_lion': torch.zeros_like(param)
                 }
             
             
             g_hat = g + beta3 * (g - self.cache[name]['g'])
             g_tilde_sq = c * g_hat * g_hat + (1-c)*(self.cache[name]['v'].detach() + g_hat * g_hat * torch.sign(g_hat * g_hat - self.cache[name]['v'].detach()))
             
-            #T = 2/(g_hat*g_hat+1e-8) #2/(g_hat*g_hat+1e-15)
             self.cache[name]['m'].detach()
             self.cache[name]['v'].detach()
             self.cache[name]['n'].detach()
@@ -349,34 +343,28 @@ class Meta(Optimizable):
             del g_tilde_sq
             self.cache[name]['n'] = beta3 * self.cache[name]['n'].data + (1. - beta3) * (g - self.cache[name]['g'].data)
             self.cache[name]['g'] = g
-            # self.cache[name]['m_lion'] = m_lion =\
-            #     beta2_lion * self.cache[name]['m_lion'].detach() + (1. - beta2_lion) * g
-            # self.cache[name]['u_lion'] = u_lion =\
-            #     beta1_lion * self.cache[name]['m_lion'].detach() + (1. - beta1_lion) * g
+            self.cache[name]['m_lion'] = m_lion =\
+                beta2_lion * self.cache[name]['m_lion'].detach() + (1. - beta2_lion) * g
+            self.cache[name]['u_lion'] = u_lion =\
+                beta1_lion * self.cache[name]['m_lion'].detach() + (1. - beta1_lion) * g
             
-            self.cache[name]['v_mean'] =\
+            self.cache[name]['v_mean'] = v_mean =\
                 (self.cache[name]['v'] + (t-1)*self.cache[name]['v_mean'].data)/t
-            # self.cache[name]['v_max'] = v_max =\
-            #     torch.maximum(v,self.cache[name]['v_max'].detach())
             
-            #psi = rho*v + (1-rho)*v_max.detach()
-            #psi = rho*self.cache[name]['v'] + (1-rho)*v_mean.detach()
             
 
             self.all_params_with_gradients.append(self.cache[name]['m'])
             self.all_params_with_gradients.append(self.cache[name]['v'])
             self.all_params_with_gradients.append(self.cache[name]['n'])
+            
 
-            # self.all_params_with_gradients.append(self.parameters['beta1'])
-            # self.all_params_with_gradients.append(self.parameters['beta2'])
-            # self.all_params_with_gradients.append(self.parameters['beta3'])
-            #self.all_params_with_gradients.append(psi)
+            m_hat = (self.cache[name]['m'] / (1. - beta1 ** float(t)))
+            v_hat = ((rho*self.cache[name]['v'] + (1-rho)*v_mean.detach()) / (1. - beta2 ** float(t)))
 
-            #m_hat = (self.cache[name]['m'] / (1. - beta1 ** float(t)))
-            #v_hat = ((rho*self.cache[name]['v'] + (1-rho)*v_mean.detach()) / (1. - beta2 ** float(t)))
-
-            dparam = gamma*((self.cache[name]['m'] / (1. - beta1 ** float(t))) + beta3 * self.cache[name]['n']) / (((rho*self.cache[name]['v'] + (1-rho)*self.cache[name]['v_mean']) / (1. - beta2 ** float(t))) ** 0.5 + self.parameters['eps'].detach()) #+ (1-gamma)*torch.sign(u_lion)
+            dparam = gamma*(m_hat + beta3 * self.cache[name]['n']) / (v_hat ** 0.5 + self.eps) + (1-gamma)*torch.sign(u_lion)
             params[name] = param.detach() - dparam*self.parameters['alpha'].detach()
+            param_cache[id(param)] = params[name]
+
     def __str__(self):
         return 'meta / ' + str(self.optimizer)
     
@@ -408,7 +396,7 @@ class Adam(Optimizable):
         return y
     
 
-    def __init__(self, alpha=0.001, beta1=0.99, beta2=0.6, log_eps=-8., optimizer=NoOpOptimizer()):
+    def __init__(self, alpha=0.001, beta1=0.9, beta2=0.95, log_eps=-6., optimizer=NoOpOptimizer()):
         self.eps = 10. ** log_eps
         parameters = {
             'alpha': torch.tensor(alpha),
@@ -568,18 +556,25 @@ class ModuleWrapper(Optimizable):
             if kk in self.parameters:
                 
                 m._parameters[k] = self.parameters[kk]
+                # to prevent disconnection
+                # m._parameters[k].data = self.parameters[kk].data
+                # self.parameters[kk] = m._parameters[k]
                 #
             # else:
             #     print("problem")
             #     m._parameters[k] = None
 
         for k, v in self.module.named_parameters(recurse=True): 
-            if k == 'lm_head.weight':
-                a = 3
+            # if k == 'lm_head.weight':
+            #     a = 3
             set_param(self.module, k, v)
+        #named_parameters ignore lm_head
         modules = {k:v for k,v in self.module.named_modules()}
         if 'lm_head' in modules:
             set_param(self.module, 'lm_head.weight', modules['lm_head'].weight)
+            #self.module.lm_head.weight.data =self.module.transformer.wte.weight.data
+            #self.module.lm_head.weight = self.module.transformer.wte.weight
+            #self.parameters['lm_head.weight'] = self.module.lm_head.weight
         del modules
 
     def hyper_step(self):
@@ -595,10 +590,7 @@ class ModuleWrapper(Optimizable):
             if kk in self.parameters:
                 
                 m._parameters[k] = self.parameters[kk]
-                #
-            # else:
-            #     print("problem")
-            #     m._parameters[k] = None
+                
 
         for k, v in self.module.named_parameters(recurse=True): 
             if k == 'lm_head.weight':
@@ -606,5 +598,7 @@ class ModuleWrapper(Optimizable):
             set_param(self.module, k, v)
         modules = {k:v for k,v in self.module.named_modules()}
         if 'lm_head' in modules:
-            set_param(self.module, 'lm_head.weight', modules['lm_head'].weight)
+            # TO PRESERVE SHARED WEIGHTS
+            self.module.lm_head.weight.data = self.module.transformer.wte.weight.data
+            self.module.transformer.wte.weight = self.module.lm_head.weight
         del modules

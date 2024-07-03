@@ -29,7 +29,7 @@ max_iters = 5000
 lr_decay_iters = 5000 # make equal to max_iters usually
 min_lr = 1e-4 # learning_rate / 10 usually
 beta2 = 0.99 # make a bit bigger because number of tokens per iter is small
-beta1 = 0.9
+beta1 = 0.85
 
 warmup_iters = 100 # not super necessary potentially
 
